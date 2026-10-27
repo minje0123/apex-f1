@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <style>*,*::before,*::after{box-sizing:border-box}:root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0;font-size:14px}img{max-width:100%}[hidden]{display:none!important}</style>
-<title>Apex Circuit v2.3</title>
+<title>Apex Circuit v2.4</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Saira+Condensed:wght@500;600;700;800&family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
@@ -412,7 +412,7 @@ table.cls .chipc{display:inline-block;width:4px;height:15px;vertical-align:-2px;
     <p class="status warn only-touch" data-show="split">같은 화면 2인은 키보드 하나를 둘이 나눠 쓰는 모드예요. 컴퓨터에서 열어 주세요. 휴대폰끼리는 온라인 대결로 함께 달릴 수 있어요.</p>
 
     <div class="netbox" data-show="online" id="netbox">
-      <p class="hint" style="margin:0">Apex v2.3 · 서버 중계 방식</p>
+      <p class="hint" style="margin:0">Apex v2.4 · 서버 중계 방식</p>
       <p class="status" id="netStatus">온라인 연결을 준비하고 있어요…</p>
       <div id="netJoin" hidden>
         <div class="field" style="margin-bottom:14px"><label for="nick">닉네임</label><input class="txt" id="nick" maxlength="8" autocomplete="off" placeholder="최대 8글자"></div>
@@ -626,17 +626,24 @@ function loadCircuitGeometry(c) {
   }
   // clearance to other parts of the circuit on the same level
   DM.fill(1e8);
-  for (let i = 0; i < N; i++) for (let j = i + gap; j < N; j++) {
-    if (N - (j - i) < gap) continue;
+  // "another part of the circuit" = far along the lap, or doubling back (hairpins, spirals) so that the
+  // distance along the track is much longer than the straight-line gap between the two points
+  const near = sm(12);
+  for (let i = 0; i < N; i++) for (let j = i + near; j < N; j++) {
+    const k = Math.min(j - i, N - (j - i)); if (k < near) continue;
     if (Math.abs(Y[i] - Y[j]) > 3) continue;
     const dx = PX[i]-PX[j], dz = PZ[i]-PZ[j], d2 = dx*dx + dz*dz;
+    if (d2 >= DM[i] && d2 >= DM[j]) continue;
+    const arc = k*DS;
+    if (k < gap && arc <= 1.5*Math.sqrt(d2) + 8) continue;
     if (d2 < DM[i]) DM[i] = d2; if (d2 < DM[j]) DM[j] = d2;
   }
   const hw0 = new Float32Array(N), wp0 = new Float32Array(N), wm0 = new Float32Array(N);
   for (let i = 0; i < N; i++) {
     const R = 1/Math.max(Math.abs(KS[i]), 1e-4), dm = Math.sqrt(DM[i]);
-    const wb = c.w * WSCALE, hw = clamp(Math.min(wb, dm/2 - 0.8, 0.8*R), 4.6, wb);
-    let wall = Math.max(hw + 0.9, Math.min(hw + KERB + (c.st ? 3 : 9), dm/2));
+    const wb = c.w * WSCALE, hwMin = clamp(dm/2 - 1.0, 3.2, 4.6);
+    const hw = clamp(Math.min(wb, dm/2 - 1.0, 0.8*R), hwMin, wb);
+    let wall = Math.max(hw + 0.9, Math.min(hw + KERB + (c.st ? 3 : 9), dm/2 - 0.05));
     let wp = wall, wm = wall;
     if (KS[i] > 0) wp = Math.max(hw + 0.9, Math.min(wp, 0.9*R)); else wm = Math.max(hw + 0.9, Math.min(wm, 0.9*R));
     hw0[i] = hw; wp0[i] = wp; wm0[i] = wm;
@@ -772,10 +779,33 @@ function disposeGroup(g) {
   });
   scene.remove(g);
 }
+/* ---- keep scenery out of the racing corridor ---- */
+const WALLMAX = new Float32Array(N);
+function prepClearance() { for (let i = 0; i < N; i++) WALLMAX[i] = Math.max(WP[i], WM[i]); }
+// true when point (x,z) is at least `margin` metres outside every wall corridor (optionally only sections below maxY)
+function pointClear(x, z, margin, maxY) {
+  for (let i = 0; i < N; i++) {
+    if (maxY != null && Y[i] > maxY) continue;
+    const r = WALLMAX[i] + margin, dx = x - PX[i], dz = z - PZ[i];
+    if (dx*dx < r*r && dz*dz < r*r && dx*dx + dz*dz < r*r) return false;
+  }
+  return true;
+}
+// rotated rectangle (centre, yaw, half width along local x, half length along local z) sampled on a ≤3 m grid
+function boxClear(cx, cz, yaw, hx, hz, margin) {
+  const nx = Math.max(1, Math.ceil(hx*2/3)), nz = Math.max(1, Math.ceil(hz*2/3)), c = Math.cos(yaw), s = Math.sin(yaw);
+  for (let a = 0; a <= nx; a++) for (let b = 0; b <= nz; b++) {
+    const lx = -hx + 2*hx*a/nx, lz = -hz + 2*hz*b/nz;
+    const x = cx + lx*c + lz*s, z = cz - lx*s + lz*c;
+    if (!pointClear(x, z, margin)) return false;
+  }
+  return true;
+}
 function buildScenery(c) {
   if (scn) disposeGroup(scn.group);
   const G = new THREE.Group(); scene.add(G);
   const S = { group: G };
+  prepClearance();
   const rnd = rndSeed(1000 + c.r*97);
   let mnx = Infinity, mxx = -Infinity, mnz = Infinity, mxz = -Infinity, cx = 0, cz = 0;
   for (let i = 0; i < N; i++) { mnx = Math.min(mnx, PX[i]); mxx = Math.max(mxx, PX[i]); mnz = Math.min(mnz, PZ[i]); mxz = Math.max(mxz, PZ[i]); cx += PX[i]; cz += PZ[i]; }
@@ -834,7 +864,9 @@ function buildScenery(c) {
     for (let k = -sm(110); k <= sm(110); k += sm(36)) {
       const i = (BRIDGE + k + N) % N; if (Y[i] < 4) continue;
       for (const s of [-1, 1]) {
-        const o = s*(s > 0 ? WP[i] : WM[i]) * 0.98, p = new THREE.Mesh(new THREE.BoxGeometry(1.4, Y[i], 1.4), pm);
+        const o = s*((s > 0 ? WP[i] : WM[i]) + 0.8);
+        if (!pointClear(PX[i]+NX[i]*o, PZ[i]+NZ[i]*o, 1.2, 0.5)) continue;
+        const p = new THREE.Mesh(new THREE.BoxGeometry(1.4, Y[i], 1.4), pm);
         p.position.set(PX[i]+NX[i]*o, Y[i]/2 - 0.9, PZ[i]+NZ[i]*o); p.castShadow = true; G.add(p);
       }
     }
@@ -856,7 +888,7 @@ function buildScenery(c) {
   // gantry with start lights
   S.lamps = [];
   {
-    const dark = new THREE.MeshLambertMaterial({ color: 0x1b2030 }), g = new THREE.Group(), span = HW[0] + 3;
+    const dark = new THREE.MeshLambertMaterial({ color: 0x1b2030 }), g = new THREE.Group(), span = Math.max(WP[0], WM[0]) + 0.9;
     for (const s of [-1, 1]) { const p = new THREE.Mesh(new THREE.BoxGeometry(0.5, 8, 0.5), dark); p.position.set(s*span, 4, 0); p.castShadow = true; g.add(p); }
     const bar = new THREE.Mesh(new THREE.BoxGeometry(span*2+0.5, 1.2, 0.8), dark); bar.position.set(0, 7.6, 0); bar.castShadow = true; g.add(bar);
     const box = new THREE.Mesh(new THREE.BoxGeometry(5.4, 1.8, 0.7), new THREE.MeshLambertMaterial({ color: 0x0b0d12 })); box.position.set(0, 6.2, -0.1); g.add(box);
@@ -908,7 +940,8 @@ function buildScenery(c) {
       const ang = Math.atan2(TX[i], TZ[i]), dm = Math.sqrt(DM[i]), len = DS*stp + 0.1;
       const wOut = out0 > 0 ? WP[i] : WM[i], wIn = out0 > 0 ? WM[i] : WP[i];
       if (dm/2 > wOut + 22 && Y[i] < 0.5) {
-        for (let t = 0; t < 4; t++) {
+        const standOk = boxClear(PX[i]+NX[i]*out0*(wOut + 9.5), PZ[i]+NZ[i]*out0*(wOut + 9.5), ang, 7.5, len/2, 0.6);
+        for (let t = 0; t < 4 && standOk; t++) {
           const off = out0*(wOut + 4 + t*3.4), h = 1.6 + t*1.6;
           const b = new THREE.Mesh(new THREE.BoxGeometry(3.4, h, len), dk); b.position.set(PX[i]+NX[i]*off, h/2, PZ[i]+NZ[i]*off); b.rotation.y = ang; b.castShadow = true; b.receiveShadow = true; G.add(b);
           for (let k = 0; k < 3 && ci < 1400; k++) {
@@ -917,10 +950,12 @@ function buildScenery(c) {
             crowd.setMatrixAt(ci, d.matrix); crowd.setColorAt(ci, col.setHex(palette[Math.floor(rnd()*palette.length)])); ci++;
           }
         }
-        const roff = out0*(wOut + 9.5), roof = new THREE.Mesh(new THREE.BoxGeometry(15, 0.4, len), roofMat);
-        roof.position.set(PX[i]+NX[i]*roff, 11, PZ[i]+NZ[i]*roff); roof.rotation.y = ang; roof.castShadow = true; G.add(roof);
+        if (standOk) {
+          const roff = out0*(wOut + 9.5), roof = new THREE.Mesh(new THREE.BoxGeometry(15, 0.4, len), roofMat);
+          roof.position.set(PX[i]+NX[i]*roff, 11, PZ[i]+NZ[i]*roff); roof.rotation.y = ang; roof.castShadow = true; G.add(roof);
+        }
       }
-      if (dm/2 > wIn + 24 && Y[i] < 0.5) {
+      if (dm/2 > wIn + 24 && Y[i] < 0.5 && boxClear(PX[i]-NX[i]*out0*(wIn + 12), PZ[i]-NZ[i]*out0*(wIn + 12), ang, 6, len/2, 0.6)) {
         const gx = -out0*(wIn + 12);
         const gar = new THREE.Mesh(new THREE.BoxGeometry(12, 7, len), garMat); gar.position.set(PX[i]+NX[i]*gx, 3.5, PZ[i]+NZ[i]*gx); gar.rotation.y = ang; gar.castShadow = true; gar.receiveShadow = true; G.add(gar);
         if ((Math.floor(i/stp))%3 !== 1) { const dx = gx + out0*6.05, door = new THREE.Mesh(new THREE.PlaneGeometry(len*0.8, 4.2), doorMat); door.position.set(PX[i]+NX[i]*dx, 2.3, PZ[i]+NZ[i]*dx); door.rotation.y = ang + Math.PI/2; G.add(door); }
@@ -930,6 +965,7 @@ function buildScenery(c) {
   }
   // city blocks and trees
   const farFromTrack = (x, z, minD) => { const m2 = minD*minD; for (let i = 0; i < N; i += 3) { const dx = x-PX[i], dz = z-PZ[i]; if (dx*dx + dz*dz < m2) return false; } return true; };
+  S.blocks = [];
   {
     const winTex = canvasTex('win', 64, 128, (g, w, h) => {
       const r = rndSeed(5); g.fillStyle = '#0b0f18'; g.fillRect(0, 0, w, h);
@@ -947,8 +983,10 @@ function buildScenery(c) {
     while (n < cnt && tries++ < 9000) {
       const x = mnx - pad + rnd()*(mxx - mnx + pad*2), z = mnz - pad + rnd()*(mxz - mnz + pad*2);
       if (!farFromTrack(x, z, minD)) continue;
-      const w = 16 + rnd()*30, dep = 16 + rnd()*30, h = c.st ? 20 + rnd()*rnd()*150 : 10 + rnd()*40;
-      d.position.set(x, h/2, z); d.scale.set(w, h, dep); d.rotation.y = rnd()*0.3; d.updateMatrix();
+      const w = 16 + rnd()*30, dep = 16 + rnd()*30, h = c.st ? 20 + rnd()*rnd()*150 : 10 + rnd()*40, yaw = rnd()*0.3;
+      if (!pointClear(x, z, Math.hypot(w, dep)/2 + 6) && !boxClear(x, z, yaw, w/2, dep/2, 6)) continue;
+      S.blocks.push([x, z, yaw, w/2, dep/2]);
+      d.position.set(x, h/2, z); d.scale.set(w, h, dep); d.rotation.y = yaw; d.updateMatrix();
       mesh.setMatrixAt(n, d.matrix); mesh.setColorAt(n, col.setHSL(0.58 + rnd()*0.1, 0.12, 0.42 + rnd()*0.3)); n++;
     }
     mesh.count = n; G.add(mesh);
@@ -960,8 +998,10 @@ function buildScenery(c) {
     const d = new THREE.Object3D(); let n = 0, tries = 0;
     while (n < cnt && tries++ < 12000) {
       const x = mnx - 300 + rnd()*(mxx - mnx + 600), z = mnz - 300 + rnd()*(mxz - mnz + 600);
-      if (!farFromTrack(x, z, 32)) continue;
+      if (!farFromTrack(x, z, 20)) continue;
       const s = 0.7 + rnd()*0.8;
+      if (!pointClear(x, z, 3.2*s + 3)) continue;
+      S.blocks.push([x, z, 0, 3.2*s, 3.2*s]);
       d.rotation.set(0, rnd()*TAU, 0); d.scale.set(s, s, s); d.position.set(x, 3 + 4.5*s, z); d.updateMatrix(); crown.setMatrixAt(n, d.matrix);
       crown.setColorAt(n, col.setHSL(0.3 + rnd()*0.06, 0.35, 0.16 + rnd()*0.1));
       d.position.set(x, 1.5*s, z); d.updateMatrix(); trunk.setMatrixAt(n, d.matrix); n++;
@@ -1265,7 +1305,7 @@ function updateHuman(p, dt, cars) {
     gas = p.v < lim*0.78; brake = p.v > lim*0.86; boostKey = false;
   }
   p.steer += (steerT - p.steer) * Math.min(1, dt*(steerT === 0 ? 9 : 5.5));
-  p.idx = nearest(p.x, p.z, p.idx, sm(84));
+  p.idx = nearest(p.x, p.z, p.idx, sm(24));
   const i = p.idx;
   p.lat = (p.x - PX[i])*NX[i] + (p.z - PZ[i])*NZ[i];
   const onTrack = Math.abs(p.lat) <= HW[i] + KERB;
@@ -1292,16 +1332,23 @@ function updateHuman(p, dt, cars) {
   if (p.v < 0) p.va = p.h;
   p.x += Math.sin(p.va)*p.v*dt; p.z += Math.cos(p.va)*p.v*dt;
   p.wallCd -= dt;
-  p.lat = (p.x - PX[i])*NX[i] + (p.z - PZ[i])*NZ[i];
-  const lim = (p.lat > 0 ? WP[i] : WM[i]) - 1.2;
-  if (Math.abs(p.lat) > lim) {
-    const s = Math.sign(p.lat), push = Math.abs(p.lat) - lim;
-    p.x -= NX[i]*s*push; p.z -= NZ[i]*s*push;
-    if (p.wallCd <= 0) { p.v *= 0.55; p.wallCd = 0.35; p.shake = Math.min(1, 0.25 + av/90); blip(90, 0.12, 'square', 0.08); }
-    const tang = fwdDot >= 0 ? ANG[i] : wrapA(ANG[i] + Math.PI);
-    p.h = wrapA(p.h + wrapA(tang - p.h)*0.5); p.va = p.h;
+  // clamp against the walls of the section the car is on *after* moving; repeat so tight corners can't be cut through
+  let wi = nearest(p.x, p.z, i, sm(25)), hitWall = false;
+  for (let it = 0; it < 4; it++) {
+    p.lat = (p.x - PX[wi])*NX[wi] + (p.z - PZ[wi])*NZ[wi];
+    const lim = (p.lat > 0 ? WP[wi] : WM[wi]) - 1.2;
+    if (Math.abs(p.lat) <= lim) break;
+    const s = Math.sign(p.lat), push = Math.abs(p.lat) - lim + 0.02;
+    p.x -= NX[wi]*s*push; p.z -= NZ[wi]*s*push;
+    if (!hitWall) {
+      hitWall = true;
+      if (p.wallCd <= 0) { p.v *= 0.55; p.wallCd = 0.35; p.shake = Math.min(1, 0.25 + av/90); blip(90, 0.12, 'square', 0.08); }
+      const tang = fwdDot >= 0 ? ANG[wi] : wrapA(ANG[wi] + Math.PI);
+      p.h = wrapA(p.h + wrapA(tang - p.h)*0.5); p.va = p.h;
+    }
+    wi = nearest(p.x, p.z, wi, sm(25));
   }
-  p.y += (Y[i] - p.y) * Math.min(1, dt*20);
+  p.y += (Y[wi] - p.y) * Math.min(1, dt*20);
   const fx = Math.sin(p.h), fz = Math.cos(p.h), sx = Math.cos(p.h), sz = -Math.sin(p.h);
   for (const c of cars) {
     if (c.ref === p) continue;
@@ -1692,7 +1739,7 @@ function showResults() {
 }
 
 /* ================= ONLINE (server relay over secure WebSocket, no account) ================= */
-const APP = 'apex23', TOPIC = 'apexcircuit-kr/v23/';
+const APP = 'apex24', TOPIC = 'apexcircuit-kr/v24/';
 const BROKERS = [
   { name: 'Eclipse', url: 'wss://mqtt.eclipseprojects.io:443/mqtt', g: 'ABCDEFGH' },
   { name: 'EMQX', url: 'wss://broker.emqx.io:8084/mqtt', g: 'JKMNPQR' },
